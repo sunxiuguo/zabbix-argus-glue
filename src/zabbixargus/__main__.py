@@ -65,6 +65,9 @@ def setup_logging(*, verbose: bool = False, quiet: bool = False):
     logging.basicConfig(level=level, format=fmt)
     # httpx logs every HTTP request at INFO, which is too noisy.
     logging.getLogger("httpx").setLevel(max(level, logging.WARNING))
+    # The decorator logs connection errors before re-raising them; callers
+    # handle these with context, so avoid duplicate tracebacks.
+    logging.getLogger("simple_rest_client.decorators").setLevel(logging.CRITICAL)
 
 
 async def verify_connections(config):

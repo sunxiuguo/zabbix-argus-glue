@@ -4,12 +4,28 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
+import httpx
+from simple_rest_client.exceptions import ClientConnectionError
+
 from zabbixargus.argus_client import ArgusClient, DuplicateIncidentError
 from zabbixargus.config import Config
 from zabbixargus.tags import build_tags
 from zabbixargus.zabbix_client import ZabbixClient, build_details_url
 
 log = logging.getLogger(__name__)
+
+
+def _is_transient_argus_error(error: Exception) -> bool:
+    # simple-rest-client also wraps decoding and local request errors.
+    if not isinstance(error, ClientConnectionError) or not error.args:
+        return False
+    cause = error.args[0]
+    return isinstance(cause, (httpx.NetworkError, httpx.TimeoutException)) or (
+        # httpcore uses this message for EOF before a response. Other remote
+        # protocol errors can indicate malformed HTTP and must remain errors.
+        isinstance(cause, httpx.RemoteProtocolError)
+        and str(cause) == "Server disconnected without sending a response."
+    )
 
 
 async def run_reconciliation_loop(
@@ -33,7 +49,17 @@ async def reconcile(zabbix: ZabbixClient, argus: ArgusClient, config: Config):
     problems = await zabbix.get_problems_with_hosts(
         resolve_hostgroups=config.requires_hostgroups()
     )
-    argus_incidents = await argus.get_open_incidents()
+    try:
+        argus_incidents = await argus.get_open_incidents()
+    except ClientConnectionError as e:
+        if not _is_transient_argus_error(e):
+            raise
+        log.warning(
+            "Argus connection error while fetching open incidents; "
+            "will retry next pass: %s",
+            e,
+        )
+        return
 
     minimum = config.severity.minimum_severity
     eligible = [p for p in problems if int(p["severity"]) >= minimum]
@@ -95,8 +121,16 @@ async def _create_missing(
             log.debug(
                 "Problem %s already has an Argus incident; not recreating", eventid
             )
-        except Exception:
-            log.exception("Failed to create incident for problem %s", eventid)
+        except Exception as e:
+            if _is_transient_argus_error(e):
+                log.warning(
+                    "Argus connection error while creating incident for problem %s; "
+                    "will retry next pass: %s",
+                    eventid,
+                    e,
+                )
+            else:
+                log.exception("Failed to create incident for problem %s", eventid)
     return created
 
 
@@ -185,6 +219,15 @@ async def _close_stale(
                 continue
             await argus.resolve_incident(incident, "Resolved by reconciliation")
             closed += 1
-        except Exception:
-            log.exception("Failed to close Argus incident %s", incident.pk)
+        except Exception as e:
+            if _is_transient_argus_error(e):
+                log.warning(
+                    "Argus connection error while closing incident %s for problem %s; "
+                    "will retry next pass: %s",
+                    incident.pk,
+                    source_id,
+                    e,
+                )
+            else:
+                log.exception("Failed to close Argus incident %s", incident.pk)
     return closed
